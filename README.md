@@ -30,14 +30,25 @@ curl -sS https://raw.githubusercontent.com/oxc-ui/netway-setup/main/setup.sh | s
 
 Non-interactive / custom relay:
 
+`sudo` resets the environment, so export the variables and use `sudo -E`:
+
+```bash
+export GOST_HOST=my-own-relay.up.railway.app
+export GOST_PORT=8796
+curl -sS https://raw.githubusercontent.com/oxc-ui/netway-setup/main/setup.sh | sudo -E bash
+```
+
+Already root? Then the plain env-prefix form works:
+
 ```bash
 GOST_HOST=my-own-relay.up.railway.app \
 GOST_PORT=8796 \
-curl -sS https://raw.githubusercontent.com/oxc-ui/netway-setup/main/setup.sh | sudo bash
+curl -sS https://raw.githubusercontent.com/oxc-ui/netway-setup/main/setup.sh | bash
 ```
 
 Env overrides: `GOST_HOST` (relay host), `GOST_URL` (full wss:// URL, takes
-precedence), `GOST_PORT` (local listen port, default 8796).
+precedence), `GOST_PORT` (local listen port, default 8796). The installer adds
+them to the sudo `env_keep` list, so exported values survive later `sudo` runs.
 
 ## What it does
 
@@ -59,6 +70,8 @@ sudo netway-cf-tunnel <your-cloudflared-token>
 ```
 
 Runs `cloudflare/cloudflared` in a sibling container with host networking.
+cloudflared does not support proxying its edge connection, so the helper needs
+direct egress to the Cloudflare edge; it does not use the gost bridge.
 
 ## After setup
 
