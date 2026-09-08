@@ -8,6 +8,7 @@ set -o pipefail
 [[ -z "$BASH" ]] && exec bash "$0" "$@"
 
 REPO="oxc-ui/netway-setup"
+[[ -n "${GOST_HOST:-}" || -n "${GOST_URL:-}" || -n "${GOST_PORT:-}" ]] && CUSTOM_ENDPOINT=1 || CUSTOM_ENDPOINT=0
 GOST_HOST="${GOST_HOST:-gost-docker-production.up.railway.app}"
 FULL_URL="${GOST_URL:-wss://sudo:sudo@${GOST_HOST}:443}"
 GOST_PORT="${GOST_PORT:-8796}"
@@ -35,11 +36,15 @@ fi
 SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 type_line() { # typewriter reveal
-  local line="$1" i c
-  for ((i=0;i<${#line};i++)); do
-    printf '%s' "${line:i:1}"
-    sleep 0.006
-  done
+  local line="$1" i
+  if [[ -t 1 ]]; then
+    for ((i=0;i<${#line};i++)); do
+      printf '%s' "${line:i:1}"
+      sleep 0.006
+    done
+  else
+    printf '%s' "$line"
+  fi
   printf '\n'
 }
 
@@ -75,7 +80,13 @@ step_box() { # step number, total, title
 }
 
 spinner() { # <pid> <msg> [timeout]
-  local pid=$1 msg=$2 ttl=${3:-180} i=0
+  local pid=$1 msg=$2 ttl=${3:-180} i=0 rc
+  if [[ ! -t 1 ]]; then
+    printf '  %s ...\n' "$msg"
+    wait "$pid"; rc=$?
+    if (( rc == 0 )); then ok "done"; else err "failed (rc $rc)"; fi
+    return "$rc"
+  fi
   printf '  %s%s%s ' "$C" "$msg" "$N"
   while kill -0 "$pid" 2>/dev/null; do
     printf '\b%s' "${SPIN:i%${#SPIN}:1}"
@@ -96,6 +107,12 @@ spinner() { # <pid> <msg> [timeout]
 
 progress() { # <pid> <msg> — growing block bar
   local pid=$1 msg=$2 width=32 i=0 rc
+  if [[ ! -t 1 ]]; then
+    printf '  %s ...\n' "$msg"
+    wait "$pid"; rc=$?
+    if (( rc == 0 )); then ok "done"; else err "failed (rc $rc)"; fi
+    return "$rc"
+  fi
   printf '  %s%s%s [' "$C" "$msg" "$N"
   while kill -0 "$pid" 2>/dev/null; do
     ((i++)); sleep 0.10
@@ -123,9 +140,32 @@ ok()  { printf '  %s✓%s %s\n' "$G" "$N" "$1"; }
 warn(){ printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
 err() { printf '  %s✗%s %s\n' "$R" "$N" "$1"; }
 
+ensure_dockerd() { # make sure docker answers; start dockerd when it is missing
+  local tries=0
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v dockerd >/dev/null 2>&1; then
+    err "dockerd not found (docker install incomplete?)"
+    return 1
+  fi
+  pgrep -x dockerd >/dev/null 2>&1 || { warn "dockerd not running — starting it"; dockerd >/tmp/dockerd.log 2>&1 & }
+  while ! docker info >/dev/null 2>&1; do
+    (( tries += 1 ))
+    if (( tries >= 30 )); then
+      err "docker daemon failed to start within 30s"
+      sed 's/^/    /' /tmp/dockerd.log 2>/dev/null | tail -15
+      warn "hint: dockerd may need a privileged container (--privileged) or a different storage driver"
+      return 1
+    fi
+    sleep 1
+  done
+  ok "docker daemon ready: $(docker --version 2>/dev/null)"
+}
+
 require_root() {
   if [[ $(id -u) -ne 0 ]]; then
-    echo "$R[!]$N need root — re-run with ${W}sudo$N"
+    echo "${R}[!]${N} need root — re-run with ${W}sudo${N}"
     exit 1
   fi
 }
@@ -140,26 +180,20 @@ TOTAL=7
 step_box 1 $TOTAL "Tunnel endpoint"
 hr
 printf '  %sRelay :%s %s\n' "$Y" "$N" "$FULL_URL"
-printf '  %sListen:%s 0.0.0.0:%s\n' "$Y" "$N" "$GOST_PORT"
+printf '  %sListen:%s 127.0.0.1:%s\n' "$Y" "$N" "$GOST_PORT"
 ok "endpoint configured"
+(( CUSTOM_ENDPOINT )) || warn "using the shared public relay — set GOST_URL for a private endpoint"
 
 # ─── Step 2: Docker ──────────────────────────────────────────────
 step_box 2 $TOTAL "Docker engine"
 hr
 if command -v docker >/dev/null 2>&1; then
-  ok "docker: $(docker --version 2>/dev/null)"
+  ok "docker cli present"
 else
   ( curl -fsSL https://get.docker.com | sh >/tmp/netway-docker-install.log 2>&1 ) &
   progress $! "Installing docker engine" || { err "docker install failed"; tail -5 /tmp/netway-docker-install.log; exit 1; }
-  dockerd >/tmp/dockerd.log 2>&1 &
-  sleep 3
-  ok "docker: $(docker --version 2>/dev/null)"
 fi
-if ! docker info >/dev/null 2>&1; then
-  warn "dockerd not responding — starting…"
-  dockerd >/tmp/dockerd.log 2>&1 &
-  sleep 3
-fi
+ensure_dockerd || exit 1
 
 # ─── Step 3: Packages ────────────────────────────────────────────
 step_box 3 $TOTAL "System packages"
@@ -182,22 +216,27 @@ QWRAP
 chmod +x /usr/local/bin/qemu-system-x86_64
 ok "qemu -no-hpet wrapper"
 
+ensure_dockerd || exit 1
+
 docker rm -f gost-bridge >/dev/null 2>&1 || true
 ( docker pull ginuerzh/gost:latest >/tmp/netway-gost-pull.log 2>&1 ) &
 progress $! "Pulling ginuerzh/gost:latest" || { err "gost image pull failed"; tail -3 /tmp/netway-gost-pull.log; exit 1; }
 
 docker run -d --restart unless-stopped \
   --name gost-bridge \
-  -p "$GOST_PORT:$GOST_PORT" \
+  -p "127.0.0.1:${GOST_PORT}:${GOST_PORT}" \
   ginuerzh/gost:latest \
   -L=:$GOST_PORT \
   -F="$FULL_URL" >/dev/null 2>&1
-sleep 2
-if docker ps --format '{{.Names}}' | grep -q gost-bridge; then
-  ok "gost-bridge up on 0.0.0.0:$GOST_PORT"
-else
-  err "gost-bridge failed to start"; docker logs gost-bridge 2>&1 | tail -5; exit 1
-fi
+tries=0
+until docker ps --format '{{.Names}}' | grep -qx gost-bridge; do
+  (( tries += 1 ))
+  if (( tries >= 15 )); then
+    err "gost-bridge failed to start"; docker logs gost-bridge 2>&1 | tail -5; exit 1
+  fi
+  sleep 1
+done
+ok "gost-bridge up on 127.0.0.1:$GOST_PORT"
 
 # ─── Step 5: System proxy ────────────────────────────────────────
 step_box 5 $TOTAL "System-wide proxy"
@@ -231,20 +270,36 @@ ok "/etc/environment"
 ok "apt bypass mirror list"
 
 cat > /etc/sudoers.d/netway-proxy <<'EOFP'
-Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy"
+Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy GOST_HOST GOST_URL GOST_PORT"
 EOFP
 chmod 440 /etc/sudoers.d/netway-proxy
 ok "sudoers preserves proxy env"
 
-# auto-start
+# auto-start: a boot hook that waits for dockerd, then restores the bridge
+cat > /usr/local/bin/netway-boot.sh <<BOOT
+#!/bin/bash
+# Started by /etc/rc.local: wait for the docker daemon, then start gost-bridge.
+for _ in \$(seq 1 30); do
+  docker info >/dev/null 2>&1 && break
+  command -v dockerd >/dev/null 2>&1 && { pgrep -x dockerd >/dev/null || dockerd >/tmp/dockerd.log 2>&1 & }
+  sleep 1
+done
+docker info >/dev/null 2>&1 || exit 1
+for _ in \$(seq 1 5); do
+  docker start gost-bridge >/dev/null 2>&1 && exit 0
+  docker run -d --restart unless-stopped -p 127.0.0.1:${GOST_PORT}:${GOST_PORT} --name gost-bridge ginuerzh/gost:latest -L=:${GOST_PORT} -F="${FULL_URL}" >/dev/null 2>&1 && exit 0
+  sleep 2
+done
+exit 1
+BOOT
+chmod +x /usr/local/bin/netway-boot.sh
 if [ -f /etc/rc.local ]; then
-  sed -i '/gost-bridge/d; /dockerd/d' /etc/rc.local 2>/dev/null || true
+  sed -i '/gost-bridge/d; /dockerd/d; /netway-boot/d' /etc/rc.local 2>/dev/null || true
 else
   printf '#!/bin/sh\n' > /etc/rc.local
   chmod +x /etc/rc.local
 fi
-sed -i '/^exit 0/i dockerd >/tmp/dockerd.log 2>&1 &' /etc/rc.local 2>/dev/null || true
-sed -i "/^exit 0/i docker start gost-bridge 2>/dev/null || docker run -d --restart unless-stopped -p ${GOST_PORT}:${GOST_PORT} --name gost-bridge ginuerzh/gost:latest -L=:${GOST_PORT} -F=\"${FULL_URL}\"" /etc/rc.local 2>/dev/null || true
+sed -i '/^exit 0/i nohup /usr/local/bin/netway-boot.sh >>/var/log/netway-boot.log 2>&1 &' /etc/rc.local 2>/dev/null || true
 ok "rc.local auto-start"
 
 # ─── Step 6: Optional Cloudflare Tunnel hook ────────────────────
@@ -253,7 +308,8 @@ hr
 cat > /usr/local/bin/netway-cf-tunnel <<'CFT'
 #!/bin/bash
 # netway-cf-tunnel <cloudflared-token>
-# Runs cloudflared inside Docker, routing its traffic through the gost proxy.
+# Runs cloudflared inside Docker. Note: cloudflared does not support proxying
+# its edge connection, so it must reach the Cloudflare edge directly.
 set -e
 TOK="$1"
 [[ -z "$TOK" ]] && { echo "usage: netway-cf-tunnel <cloudflared-token>"; exit 1; }
@@ -261,7 +317,7 @@ docker rm -f cf-tunnel >/dev/null 2>&1 || true
 docker run -d --restart unless-stopped --name cf-tunnel --network host \
   --entrypoint sh \
   cloudflare/cloudflared:latest \
-  -c "cloudflared tunnel --no-autoupdate --post-quantum run --token $TOK"
+  -c "cloudflared tunnel --no-autoupdate --post-quantum run --token \"$TOK\""
 echo "cloudflare tunnel started as 'cf-tunnel'"
 CFT
 chmod +x /usr/local/bin/netway-cf-tunnel
